@@ -3,7 +3,8 @@
 if [ -n "${BASH_VERSION:-}" ] && [ -f "$0" ] && grep -q "$(printf '\r')" "$0" 2>/dev/null; then _lf="${TMPDIR:-/tmp}/install-secret-guard.$$.sh"; tr -d '\r' < "$0" > "$_lf" && _SG_LF_COPY="$_lf" exec bash "$_lf" "$@"; fi #
 # ─────────────────────────────────────────────────────────────
 # NULogic secret-guard installer (version @@VERSION@@)
-# Installs the Claude Code secret-guard hook for the current user.
+# Installs the Claude Code secret-guard hook, either for the current user
+# or system-wide and admin-enforced (--managed).
 # Run "bash install-secret-guard.sh --help" for options.
 #
 # It tries hard not to give up: missing tools are set up, a failing
@@ -18,14 +19,6 @@ VERSION="@@VERSION@@"
 REPORT_URL="${SECRET_GUARD_REPORT_URL:-https://secret-guard-api.vercel.app/api/installs}"
 REPORT_TOKEN="${SECRET_GUARD_REPORT_TOKEN:-[REDACTED]}"
 
-CLAUDE_DIR="$HOME/.claude"
-HOOK_DIR="$CLAUDE_DIR/hooks"
-HOOK_PATH="$HOOK_DIR/secret-guard.sh"
-BIN_DIR="$HOOK_DIR/bin"   # helper tools set up by this installer, only when needed
-# Deny rules this installer added (so uninstall leaves the user's own rules alone)
-RULES_RECORD="$HOOK_DIR/secret-guard.added-rules"
-SETTINGS="$CLAUDE_DIR/settings.json"
-HOOK_CMD='bash "$HOME/.claude/hooks/secret-guard.sh"'
 HOOK_MATCHER='Bash|Read|Write|Edit|MultiEdit|Grep|AskUserQuestion'
 DENY_RULES=(
   'Read(**/.env)'
@@ -34,6 +27,8 @@ DENY_RULES=(
   'Read(**/secrets/**)'
   'Read(~/.aws/credentials)'
 )
+# Claude Code version that honours "onFailure": "block" on hooks
+ONFAILURE_MIN_VERSION="2.1.295"
 
 # jq is downloaded from its official GitHub release when neither jq nor
 # python3 is available. Checksums are from the release's sha256sum.txt.
@@ -56,38 +51,73 @@ usage() {
   cat <<'EOF'
 NULogic secret-guard installer
 
-  bash install-secret-guard.sh               install or update
-  bash install-secret-guard.sh --uninstall   remove the hook and its rules
-  bash install-secret-guard.sh --no-report   don't send the install report
-  bash install-secret-guard.sh --yes         approve tool installs without asking
+For your own user (no admin needed; you can remove it again):
+  bash install-secret-guard.sh                  install or update
+  bash install-secret-guard.sh --uninstall      remove it
 
-Works on macOS, Linux, and Windows via Git Bash or WSL. Missing tools (jq,
-GNU grep/sed) are set up automatically; anything that needs sudo or a
-package manager is asked about first unless you pass --yes.
+For every user on this machine, enforced (run by IT / an admin):
+  sudo bash install-secret-guard.sh --managed               install or update
+  sudo bash install-secret-guard.sh --managed --uninstall   remove it
+    --strict-permissions   only the admin policy's permission rules apply;
+                           users' own allow/deny rules are ignored
+    --require-version      refuse to start Claude Code older than 2.1.295,
+                           so a hook that times out also blocks (fail closed)
+
+Other options:
+  --no-report   don't send the install report
+  --yes         approve tool installs (package manager, sudo) without asking
+
+Works on macOS, Linux, and Windows via Git Bash or WSL (--managed: macOS,
+Linux and WSL). Missing tools (jq, GNU grep/sed) are set up automatically.
 EOF
 }
 
 MODE=install
+SCOPE=user
 SEND_REPORT=1
 ASSUME_YES=0
+STRICT_PERMISSIONS=0
+REQUIRE_VERSION=0
 for arg in "$@"; do
   case "$arg" in
-    --uninstall) MODE=uninstall ;;
-    --no-report) SEND_REPORT=0 ;;
-    --yes|-y)    ASSUME_YES=1 ;;
-    -h|--help)   usage; exit 0 ;;
-    *)           echo "Unknown option: $arg (try --help)" >&2; exit 1 ;;
+    --uninstall)          MODE=uninstall ;;
+    --managed)            SCOPE=managed ;;
+    --strict-permissions) STRICT_PERMISSIONS=1 ;;
+    --require-version)    REQUIRE_VERSION=1 ;;
+    --no-report)          SEND_REPORT=0 ;;
+    --yes|-y)             ASSUME_YES=1 ;;
+    -h|--help)            usage; exit 0 ;;
+    *)                    echo "Unknown option: $arg (try --help)" >&2; exit 1 ;;
   esac
 done
+if [ "$SCOPE" = user ] && { [ "$STRICT_PERMISSIONS" = 1 ] || [ "$REQUIRE_VERSION" = 1 ]; }; then
+  echo "--strict-permissions and --require-version only apply with --managed." >&2
+  exit 1
+fi
 
-# ── Don't install for root by mistake ────────────────────────
-if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-  echo "This installs for your own user, so it shouldn't run with sudo."
-  if [ -f "$0" ] && command -v sudo >/dev/null 2>&1; then
-    echo "Re-running as $SUDO_USER..."
-    exec sudo -u "$SUDO_USER" -H bash "$0" "$@"
+# Testing only: put every system path under this folder and skip the root check.
+TEST_ROOT="${SECRET_GUARD_TEST_ROOT:-}"
+
+# ── Right user for the job ───────────────────────────────────
+if [ "$SCOPE" = user ]; then
+  # A per-user install under sudo would install for root by mistake.
+  if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    echo "A per-user install shouldn't run with sudo (use --managed for a system-wide install)."
+    if [ -f "$0" ] && command -v sudo >/dev/null 2>&1; then
+      echo "Re-running as $SUDO_USER..."
+      exec sudo -u "$SUDO_USER" -H bash "$0" "$@"
+    fi
+    echo "Run it again without sudo: bash install-secret-guard.sh" >&2
+    exit 1
   fi
-  echo "Run it again without sudo: bash install-secret-guard.sh" >&2
+elif [ -z "$TEST_ROOT" ] && [ "$(id -u 2>/dev/null)" != 0 ]; then
+  echo "--managed changes system files, so it needs admin rights."
+  if [ -f "$0" ] && command -v sudo >/dev/null 2>&1 && { exec 3</dev/tty; } 2>/dev/null; then
+    exec 3<&-
+    echo "Re-running with sudo..."
+    exec sudo bash "$0" "$@"
+  fi
+  echo "Run: sudo bash install-secret-guard.sh --managed" >&2
   exit 1
 fi
 
@@ -117,6 +147,17 @@ ok()    { printf '  ✓ %s\n' "$*"; }
 warn()  { printf '  ! %s\n' "$*"; }
 fixed() { printf '  ↻ %s\n' "$*"; FIXES="${FIXES:+$FIXES; }$*"; }
 
+# Claude Code's version, read before a managed install narrows PATH
+CLAUDE_VERSION="$(claude --version 2>/dev/null | head -1)"
+if [ -z "$CLAUDE_VERSION" ] && [ -n "${SUDO_USER:-}" ] && command -v sudo >/dev/null 2>&1; then
+  CLAUDE_VERSION="$(sudo -u "$SUDO_USER" -i sh -c 'claude --version' 2>/dev/null | head -1)"
+fi
+if [ "$SCOPE" = managed ]; then
+  # Use only system tools, as the managed guard does at run time.
+  PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+  export PATH
+fi
+
 # ── Basic tools for the installer's own use ──────────────────
 # The installer picks a grep and sed that actually work, so a broken one
 # earlier on PATH can't break the installer itself.
@@ -140,7 +181,9 @@ G="$(first_working_grep)" || G=""
 S="$(first_working_sed)" || S=""
 
 # ── Identify the machine ─────────────────────────────────────
-USER_NAME="$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)"
+if [ "$SCOPE" = managed ] && [ -n "${SUDO_USER:-}" ]; then USER_NAME="$SUDO_USER"
+else USER_NAME="$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)"
+fi
 HOST_NAME="$(hostname 2>/dev/null || uname -n)"
 ARCH="$(uname -m 2>/dev/null)"
 case "$(uname -s)" in
@@ -157,7 +200,31 @@ case "$(uname -s)" in
     OS="$(uname -s)"
     OS_VERSION="$(uname -r)" ;;
 esac
-CLAUDE_VERSION="$(claude --version 2>/dev/null | head -1)"
+
+# ── Where things go ──────────────────────────────────────────
+if [ "$SCOPE" = managed ]; then
+  case "$OS" in
+    macos)     POLICY_DIR="$TEST_ROOT/Library/Application Support/ClaudeCode" ;;
+    linux|wsl) POLICY_DIR="$TEST_ROOT/etc/claude-code" ;;
+    *) echo "--managed supports macOS, Linux and WSL. On $OS, use the per-user install for now." >&2; exit 1 ;;
+  esac
+  GUARD_DIR="$TEST_ROOT/opt/nulogic"
+  SETTINGS="$POLICY_DIR/managed-settings.json"
+  HOOK_PATH="$GUARD_DIR/secret-guard.sh"
+  # Fails closed even on Claude Code versions without "onFailure": a missing
+  # or crashing script exits 2, which blocks.
+  HOOK_CMD="[ -r \"$HOOK_PATH\" ] || { echo 'NULogic secret-guard is missing. Contact IT.' >&2; exit 2; }; bash \"$HOOK_PATH\" || exit 2"
+else
+  GUARD_DIR="$HOME/.claude/hooks"
+  SETTINGS="$HOME/.claude/settings.json"
+  HOOK_PATH="$GUARD_DIR/secret-guard.sh"
+  HOOK_CMD='bash "$HOME/.claude/hooks/secret-guard.sh"'
+fi
+CLAUDE_DIR="$HOME/.claude"
+BIN_DIR="$GUARD_DIR/bin"   # helper tools set up by this installer, only when needed
+# What this installer added, so uninstall removes only that and leaves the rest
+RULES_RECORD="$GUARD_DIR/secret-guard.added-rules"
+EXTRAS_RECORD="$GUARD_DIR/secret-guard.added-settings.json"
 
 # ── Asking, sudo, downloads ──────────────────────────────────
 has_tty() { { exec 3</dev/tty; } 2>/dev/null || return 1; exec 3<&-; return 0; }
@@ -213,6 +280,19 @@ sha256_of() {
   fi
 }
 
+version_lt() {  # a, b → 0 if version a < b (numeric, dot-separated)
+  local a="$1" b="$2" x y
+  while [ -n "$a" ] || [ -n "$b" ]; do
+    x="${a%%.*}"; y="${b%%.*}"
+    x="${x%%[!0-9]*}"; y="${y%%[!0-9]*}"
+    [ "${x:-0}" -lt "${y:-0}" ] && return 0
+    [ "${x:-0}" -gt "${y:-0}" ] && return 1
+    case "$a" in *.*) a="${a#*.}" ;; *) a="" ;; esac
+    case "$b" in *.*) b="${b#*.}" ;; *) b="" ;; esac
+  done
+  return 1
+}
+
 # Installs packages with whatever package manager this machine has.
 # $1 = what for (shown to the user); then "manager:package list" entries.
 install_packages() {
@@ -220,7 +300,7 @@ install_packages() {
   shift
   for entry in "$@"; do
     case "$entry" in
-      brew:*)   command -v brew    >/dev/null 2>&1 && { pm=brew;   pkgs="${entry#brew:}"; break; } ;;
+      brew:*)   command -v brew    >/dev/null 2>&1 && [ "$(id -u)" != 0 ] && { pm=brew; pkgs="${entry#brew:}"; break; } ;;
       apt:*)    command -v apt-get >/dev/null 2>&1 && { pm=apt;    pkgs="${entry#apt:}"; break; } ;;
       dnf:*)    command -v dnf     >/dev/null 2>&1 && { pm=dnf;    pkgs="${entry#dnf:}"; break; } ;;
       yum:*)    command -v yum     >/dev/null 2>&1 && { pm=yum;    pkgs="${entry#yum:}"; break; } ;;
@@ -262,6 +342,7 @@ json_str() { printf '"%s"' "$(printf '%s' "$1" | "${S:-sed}" -e 's/\\/\\\\/g' -e
 
 report_enabled() {
   [ "$SEND_REPORT" = 1 ] || return 1
+  [ -z "$TEST_ROOT" ] || return 1
   case "$REPORT_URL" in *'[YOUR-API]'*) return 1 ;; esac
   case "$REPORT_TOKEN" in *'[REDACTED]'*) return 1 ;; esac
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
@@ -270,6 +351,7 @@ report_enabled() {
 report() {  # status, detail
   report_enabled || return 0
   local detail="${2:-}" payload
+  [ "$SCOPE" = managed ] && detail="$detail [managed, system-wide]"
   [ -n "$FIXES" ] && detail="$detail (fixes: $FIXES)"
   payload="{\"event\":$(json_str "$MODE"),\"status\":$(json_str "$1"),\"detail\":$(json_str "$detail")"
   payload="$payload,\"script_version\":$(json_str "$VERSION"),\"username\":$(json_str "$USER_NAME")"
@@ -359,15 +441,15 @@ download_jq() {
 
 ensure_json_tool() {
   pick_json_tool && return 0
-  warn "Neither jq nor python3 is available; one is needed to edit settings.json."
+  warn "Neither jq nor python3 is available; one is needed to edit the settings file."
   download_jq && return 0
-  install_packages "editing settings.json" \
+  install_packages "editing the settings file" \
     brew:jq apt:jq dnf:jq yum:jq apk:jq pacman:jq zypper:jq winget:jqlang.jq scoop:jq \
     && pick_json_tool && return 0
   return 1
 }
 
-# ── settings.json: validate, repair common problems ──────────
+# ── Settings file: validate, repair common problems ──────────
 SETTINGS_SRC=""   # file to read settings from ("" = start from {})
 
 json_check() {  # file → 0 if valid JSON; error text in $TMP_DIR/json.err
@@ -382,12 +464,12 @@ prepare_settings() {
   SETTINGS_SRC=""
   [ -f "$SETTINGS" ] || return 0
   if ! "$G" -q '[^[:space:]]' "$SETTINGS" 2>/dev/null; then
-    fixed "settings.json was empty, so starting from a fresh one"
+    fixed "$(basename "$SETTINGS") was empty, so starting from a fresh one"
     return 0
   fi
   if json_check "$SETTINGS"; then SETTINGS_SRC="$SETTINGS"; return 0; fi
 
-  warn "settings.json isn't valid JSON. Trying to repair it (the original will be backed up)..."
+  warn "$(basename "$SETTINGS") isn't valid JSON. Trying to repair it (the original will be backed up)..."
   local repaired="$TMP_DIR/settings.repaired.json"
   # Remove a byte-order mark, Windows line endings, whole-line // comments
   # and trailing commas: the usual hand-editing mistakes.
@@ -406,7 +488,7 @@ PY
   fi
   if [ -s "$repaired" ] && json_check "$repaired"; then
     SETTINGS_SRC="$repaired"
-    fixed "Repaired settings.json (comments, trailing commas or encoding)"
+    fixed "Repaired $(basename "$SETTINGS") (comments, trailing commas or encoding)"
     return 0
   fi
   json_check "$SETTINGS"
@@ -415,7 +497,7 @@ PY
 
 ensure_writable() {
   local p bad=""
-  for p in "$CLAUDE_DIR" "$HOOK_DIR" "$SETTINGS"; do
+  for p in "$CLAUDE_DIR" "$GUARD_DIR" "$SETTINGS"; do
     if [ -e "$p" ] && [ ! -w "$p" ]; then bad="$p"; fi
   done
   [ -z "$bad" ] && return 0
@@ -430,7 +512,24 @@ ensure_writable() {
 }
 
 # ── Settings merge ───────────────────────────────────────────
-# Prints the deny rules currently in settings.json, one per line.
+# Admin-only settings a managed install enforces, as [{path, value}] JSON.
+managed_extras() {
+  local extras='{"path":["allowManagedHooksOnly"],"value":true}'
+  extras="$extras,{\"path\":[\"permissions\",\"disableBypassPermissionsMode\"],\"value\":\"disable\"}"
+  [ "$STRICT_PERMISSIONS" = 1 ] && extras="$extras,{\"path\":[\"allowManagedPermissionRulesOnly\"],\"value\":true}"
+  [ "$REQUIRE_VERSION" = 1 ] && extras="$extras,{\"path\":[\"requiredMinimumVersion\"],\"value\":\"$ONFAILURE_MIN_VERSION\"}"
+  printf '[%s]' "$extras"
+}
+
+hook_json() {  # the hook entry this install registers
+  if [ "$SCOPE" = managed ]; then
+    printf '{"type":"command","command":%s,"timeout":15,"onFailure":"block"}' "$(json_str "$HOOK_CMD")"
+  else
+    printf '{"type":"command","command":%s}' "$(json_str "$HOOK_CMD")"
+  fi
+}
+
+# Prints the deny rules currently in the settings file, one per line.
 current_deny_rules() {
   [ -n "$SETTINGS_SRC" ] || return 0
   if [ "$JSON_TOOL" = jq ]; then
@@ -440,11 +539,52 @@ current_deny_rules() {
   fi
 }
 
+# Prints which of the given extras ([{path, value}]) aren't set yet, as JSON.
+missing_extras() {
+  local src="$SETTINGS_SRC"
+  [ -n "$src" ] || { printf '%s' "$1"; return 0; }
+  if [ "$JSON_TOOL" = jq ]; then
+    "$JQ_BIN" -c --argjson extras "$1" '. as $s | [$extras[] | select(. as $e | ($s | getpath($e.path)) == null)]' "$src"
+  else
+    python3 - "$src" "$1" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+def get(d, path):
+    for key in path:
+        if not isinstance(d, dict) or key not in d:
+            return None
+        d = d[key]
+    return d
+print(json.dumps([e for e in json.loads(sys.argv[2]) if get(data, e["path"]) is None]))
+PY
+  fi
+}
+
+# Set operations on extras lists, matched by path. $1 = minus | union.
+#   minus a b: entries of a whose path isn't in b
+#   union a b: a plus the entries of b whose path isn't in a
+extras_op() {
+  if [ "$JSON_TOOL" = jq ]; then
+    "$JQ_BIN" -nc --arg op "$1" --argjson a "$2" --argjson b "$3" '
+      if $op == "minus" then [$a[] | select(.path as $p | any($b[]; .path == $p) | not)]
+      else $a + [$b[] | select(.path as $p | any($a[]; .path == $p) | not)] end'
+  else
+    python3 -c '
+import json, sys
+op, a, b = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+pa, pb = [e["path"] for e in a], [e["path"] for e in b]
+print(json.dumps([e for e in a if e["path"] not in pb] if op == "minus" else a + [e for e in b if e["path"] not in pa]))
+' "$1" "$2" "$3"
+  fi
+}
+
 # Prints the updated settings JSON to stdout.
-# $1 = install | uninstall; remaining args = deny rules to add or remove.
+# $1 = install | uninstall, $2 = extras to set, $3 = extras to remove,
+# remaining args = deny rules to add or remove.
 transform_settings() {
-  local mode="$1" src="$TMP_DIR/settings.in.json"
-  shift
+  local mode="$1" extras="$2" unset_extras="$3" src="$TMP_DIR/settings.in.json" hook
+  shift 3
+  hook="$(hook_json)"
   if [ -n "$SETTINGS_SRC" ]; then cp "$SETTINGS_SRC" "$src"; else printf '{}' > "$src"; fi
 
   if [ "$JSON_TOOL" = jq ]; then
@@ -452,17 +592,20 @@ transform_settings() {
     if [ $# -gt 0 ]; then
       deny_json="$(printf '%s\n' "$@" | "$JQ_BIN" -R . | "$JQ_BIN" -s .)" || return 1
     fi
-    "$JQ_BIN" --arg mode "$mode" --arg cmd "$HOOK_CMD" --arg matcher "$HOOK_MATCHER" --argjson deny "$deny_json" '
+    "$JQ_BIN" --arg mode "$mode" --argjson hook "$hook" --arg matcher "$HOOK_MATCHER" \
+      --argjson deny "$deny_json" --argjson extras "$extras" --argjson unset "$unset_extras" '
       def ours: tostring | contains("secret-guard.sh");
       .permissions = (.permissions // {})
       | .permissions.deny = (.permissions.deny // [])
       | .hooks = (.hooks // {})
       | .hooks.UserPromptSubmit = [(.hooks.UserPromptSubmit // [])[] | select(ours | not)]
       | .hooks.PreToolUse = [(.hooks.PreToolUse // [])[] | select(ours | not)]
+      | reduce $unset[] as $e (.; delpaths([$e.path]))
       | if $mode == "install" then
           .permissions.deny += ($deny - .permissions.deny)
-          | .hooks.UserPromptSubmit += [{hooks: [{type: "command", command: $cmd}]}]
-          | .hooks.PreToolUse += [{matcher: $matcher, hooks: [{type: "command", command: $cmd}]}]
+          | .hooks.UserPromptSubmit += [{hooks: [$hook]}]
+          | .hooks.PreToolUse += [{matcher: $matcher, hooks: [$hook]}]
+          | reduce $extras[] as $e (.; setpath($e.path; $e.value))
         else
           .permissions.deny -= $deny
         end
@@ -472,12 +615,19 @@ transform_settings() {
       | if .permissions == {} then del(.permissions) else . end
     ' "$src"
   else
-    python3 - "$src" "$mode" "$HOOK_CMD" "$HOOK_MATCHER" "$@" <<'PY'
+    python3 - "$src" "$mode" "$hook" "$HOOK_MATCHER" "$extras" "$unset_extras" "$@" <<'PY'
 import json, sys
-path, mode, cmd, matcher, *deny = sys.argv[1:]
+path, mode, hook, matcher, extras, unset_extras, *deny = sys.argv[1:]
+hook, extras, unset_extras = json.loads(hook), json.loads(extras), json.loads(unset_extras)
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
 ours = lambda entry: "secret-guard.sh" in json.dumps(entry)
+for e in unset_extras:
+    d = data
+    for key in e["path"][:-1]:
+        d = d.get(key, {}) if isinstance(d, dict) else {}
+    if isinstance(d, dict):
+        d.pop(e["path"][-1], None)
 perms = data.setdefault("permissions", {})
 rules = perms.setdefault("deny", [])
 hooks = data.setdefault("hooks", {})
@@ -485,8 +635,13 @@ for event in ("UserPromptSubmit", "PreToolUse"):
     hooks[event] = [e for e in hooks.get(event, []) if not ours(e)]
 if mode == "install":
     rules += [r for r in deny if r not in rules]
-    hooks["UserPromptSubmit"].append({"hooks": [{"type": "command", "command": cmd}]})
-    hooks["PreToolUse"].append({"matcher": matcher, "hooks": [{"type": "command", "command": cmd}]})
+    hooks["UserPromptSubmit"].append({"hooks": [hook]})
+    hooks["PreToolUse"].append({"matcher": matcher, "hooks": [hook]})
+    for e in extras:
+        d = data
+        for key in e["path"][:-1]:
+            d = d.setdefault(key, {})
+        d[e["path"][-1]] = e["value"]
 else:
     perms["deny"] = [r for r in rules if r not in deny]
 for event in [e for e, v in hooks.items() if v == []]:
@@ -496,21 +651,24 @@ if not hooks:
 if not perms.get("deny"):
     perms.pop("deny", None)
 if not perms:
-    del data["permissions"]
+    data.pop("permissions", None)
 print(json.dumps(data, indent=2))
 PY
   fi
 }
 
-update_settings() {  # install | uninstall, then the deny rules to add or remove
-  local out="$TMP_DIR/settings.out.json" backup
+update_settings() {  # install | uninstall, extras JSON, then the deny rules
+  local out="$TMP_DIR/settings.out.json" backup old
   transform_settings "$@" > "$out" || fail "Couldn't update $SETTINGS."
   json_check "$out" || fail "Settings update produced invalid JSON; $SETTINGS left unchanged."
   if [ -f "$SETTINGS" ]; then
     backup="$SETTINGS.bak-secret-guard-$(date +%Y%m%d%H%M%S)"
     cp "$SETTINGS" "$backup" || fail "Couldn't back up $SETTINGS"
     ok "Backed up settings to $backup"
+    # Keep only the three newest backups
+    ls -1t "$SETTINGS".bak-secret-guard-* 2>/dev/null | tail -n +4 | while IFS= read -r old; do rm -f "$old"; done
   fi
+  mkdir -p "$(dirname "$SETTINGS")" || fail "Couldn't create $(dirname "$SETTINGS")"
   # Write in place (not mv) so symlinked settings files keep working.
   cat "$out" > "$SETTINGS" || fail "Couldn't write $SETTINGS"
 }
@@ -637,8 +795,24 @@ selftest_and_heal() {
   fail "Self-test still fails after trying every fix ($TESTS_PASSED passed, $TESTS_FAILED failed). Nothing was changed. Send the lines above to whoever gave you this script."
 }
 
+# Runs the registered hook command the way Claude Code does; prints its exit code.
+run_hook() {  # prompt
+  printf '{"hook_event_name":"UserPromptSubmit","prompt":"%s"}' "$1" \
+    | SECRET_GUARD_LOG="$TMP_DIR/final.log" sh -c "$HOOK_CMD" >/dev/null 2>&1
+  echo $?
+}
+
+lock_down() {  # owner root, writable by root only
+  [ -n "$TEST_ROOT" ] && return 0
+  chown -R 0:0 "$@" 2>/dev/null || chown -R 0 "$@"
+}
+
 # ── Run ──────────────────────────────────────────────────────
-say "NULogic secret-guard $MODE (v$VERSION)"
+if [ "$SCOPE" = managed ]; then
+  say "NULogic secret-guard $MODE, system-wide (managed) (v$VERSION)"
+else
+  say "NULogic secret-guard $MODE (v$VERSION)"
+fi
 say "User: $USER_NAME   Machine: $HOST_NAME   OS: $OS $OS_VERSION ($ARCH)"
 if report_enabled; then
   say "This sends a short $MODE report (username, machine name, OS, result) to"
@@ -654,18 +828,22 @@ if [ -z "$G" ] || [ -z "$S" ]; then
   S="$(first_working_sed)" || { S=sed; fail "sed still doesn't work after installing it."; }
 fi
 ok "Text tools: $G, $S"
-ensure_json_tool || fail "Couldn't set up jq or python3 to edit settings.json. Install either one and re-run."
+ensure_json_tool || fail "Couldn't set up jq or python3 to edit the settings file. Install either one and re-run."
 if [ "$JSON_TOOL" = jq ]; then ok "Using jq${DOWNLOADED_JQ:+ (downloaded)} to edit settings"; else ok "Using python3 to edit settings"; fi
 if [ -n "$CLAUDE_VERSION" ]; then ok "Claude Code found: $CLAUDE_VERSION"
-else warn "Claude Code CLI not found on PATH. Installing anyway; it takes effect once Claude Code is installed."
+else warn "Claude Code not found for this user. Installing anyway; it takes effect once Claude Code is installed."
 fi
-for managed in "/Library/Application Support/ClaudeCode/managed-settings.json" \
-               "/etc/claude-code/managed-settings.json"; do
-  if [ -f "$managed" ] && "$G" -q '"allowManagedHooksOnly"[[:space:]]*:[[:space:]]*true' "$managed"; then
-    warn "$managed only allows managed hooks, so a user-level hook won't run."
-  fi
-done
-ensure_writable
+if [ "$SCOPE" = user ]; then
+  for managed in "/Library/Application Support/ClaudeCode/managed-settings.json" \
+                 "/etc/claude-code/managed-settings.json"; do
+    if [ -f "$managed" ] && "$G" -q '"allowManagedHooksOnly"[[:space:]]*:[[:space:]]*true' "$managed"; then
+      warn "$managed only allows managed hooks, so a per-user hook won't run."
+    fi
+  done
+  ensure_writable
+else
+  ok "Policy file: $SETTINGS"
+fi
 prepare_settings
 
 if [ "$MODE" = uninstall ]; then
@@ -679,12 +857,20 @@ if [ "$MODE" = uninstall ]; then
     else
       REMOVE_RULES=("${DENY_RULES[@]}")
     fi
+    REMOVE_EXTRAS='[]'
+    if [ -f "$EXTRAS_RECORD" ]; then REMOVE_EXTRAS="$(cat "$EXTRAS_RECORD")"
+    elif [ "$SCOPE" = managed ]; then REMOVE_EXTRAS="$(managed_extras)"
+    fi
     # ${arr[@]+...} keeps bash 3.2 (macOS) happy when the array is empty under set -u
-    update_settings uninstall ${REMOVE_RULES[@]+"${REMOVE_RULES[@]}"}
-    ok "Removed secret-guard hooks and its deny rules from $SETTINGS"
+    update_settings uninstall '[]' "$REMOVE_EXTRAS" ${REMOVE_RULES[@]+"${REMOVE_RULES[@]}"}
+    ok "Removed secret-guard from $SETTINGS"
+    if [ "$SCOPE" = managed ] && [ "$(tr -d '[:space:]' < "$SETTINGS")" = '{}' ]; then
+      rm -f "$SETTINGS" && ok "Removed the now-empty policy file"
+    fi
   fi
-  rm -f "$HOOK_PATH" "$RULES_RECORD"
+  rm -f "$HOOK_PATH" "$RULES_RECORD" "$EXTRAS_RECORD"
   rm -rf "$BIN_DIR"
+  [ "$SCOPE" = managed ] && rmdir "$GUARD_DIR" 2>/dev/null
   ok "Removed $HOOK_PATH and its helper tools"
   report success "uninstalled"
   say ""
@@ -696,8 +882,14 @@ step "Testing the guard on this machine"
 selftest_and_heal
 
 step "Installing"
-mkdir -p "$HOOK_DIR" || fail "Couldn't create $HOOK_DIR"
-{ cp "$TMP_DIR/secret-guard.sh" "$HOOK_PATH" && chmod 755 "$HOOK_PATH"; } || fail "Couldn't write $HOOK_PATH"
+mkdir -p "$GUARD_DIR" || fail "Couldn't create $GUARD_DIR"
+cp "$TMP_DIR/secret-guard.sh" "$TMP_DIR/install-copy.sh"
+if [ "$SCOPE" = managed ]; then
+  # The managed copy ignores the user's PATH and overrides at run time.
+  "$S" 's/^SECRET_GUARD_MANAGED=0 /SECRET_GUARD_MANAGED=1 /' "$TMP_DIR/secret-guard.sh" > "$TMP_DIR/install-copy.sh"
+  "$G" -q '^SECRET_GUARD_MANAGED=1 ' "$TMP_DIR/install-copy.sh" || fail "Couldn't prepare the managed copy of the guard."
+fi
+{ cp "$TMP_DIR/install-copy.sh" "$HOOK_PATH" && chmod 755 "$HOOK_PATH"; } || fail "Couldn't write $HOOK_PATH"
 ok "Hook script at $HOOK_PATH"
 if [ -n "$SHIM_GREP" ]; then
   make_helper_tools "$BIN_DIR" "$SHIM_GREP" "$SHIM_SED"
@@ -711,7 +903,9 @@ if [ -n "$DOWNLOADED_JQ" ]; then
 fi
 rmdir "$BIN_DIR" 2>/dev/null
 
-# On first install, remember which deny rules were new so uninstall removes only those.
+EXTRAS='[]'
+[ "$SCOPE" = managed ] && EXTRAS="$(managed_extras)"
+# On first install, remember what was new so uninstall removes only that.
 if [ ! -f "$RULES_RECORD" ]; then
   EXISTING_RULES="$(current_deny_rules)"
   : > "$TMP_DIR/added-rules"
@@ -719,23 +913,47 @@ if [ ! -f "$RULES_RECORD" ]; then
     printf '%s\n' "$EXISTING_RULES" | "$G" -qxF -- "$rule" || printf '%s\n' "$rule" >> "$TMP_DIR/added-rules"
   done
 fi
-update_settings install "${DENY_RULES[@]}"
+# Admin settings: add the ones asked for now, drop ones an earlier run added
+# that aren't asked for any more, and keep the record of what we added current.
+OLD_EXTRAS='[]'
+[ -f "$EXTRAS_RECORD" ] && OLD_EXTRAS="$(cat "$EXTRAS_RECORD")"
+STALE_EXTRAS="$(extras_op minus "$OLD_EXTRAS" "$EXTRAS")" || fail "Couldn't read $EXTRAS_RECORD."
+NEW_EXTRAS="$(missing_extras "$EXTRAS")" || fail "Couldn't read $SETTINGS."
+NEW_EXTRAS="$(extras_op union "$(extras_op minus "$OLD_EXTRAS" "$STALE_EXTRAS")" "$NEW_EXTRAS")" || fail "Couldn't update $EXTRAS_RECORD."
+update_settings install "$EXTRAS" "$STALE_EXTRAS" "${DENY_RULES[@]}"
 [ -f "$RULES_RECORD" ] || cp "$TMP_DIR/added-rules" "$RULES_RECORD"
-ok "Hooks and deny rules added to $SETTINGS"
+printf '%s\n' "$NEW_EXTRAS" > "$EXTRAS_RECORD"
+if [ "$SCOPE" = managed ]; then
+  chmod 755 "$GUARD_DIR" "$POLICY_DIR"; chmod 644 "$SETTINGS" "$RULES_RECORD" "$EXTRAS_RECORD"
+  [ -d "$BIN_DIR" ] && chmod -R 755 "$BIN_DIR"
+  lock_down "$GUARD_DIR" "$POLICY_DIR"
+  ok "Policy written to $SETTINGS (only admins can change it)"
+  ok "Enforced: admin hooks only, permission-bypass mode off$([ "$STRICT_PERMISSIONS" = 1 ] && echo ", admin permission rules only")$([ "$REQUIRE_VERSION" = 1 ] && echo ", Claude Code $ONFAILURE_MIN_VERSION+")"
+else
+  ok "Hooks and deny rules added to $SETTINGS"
+fi
 
-# Final check: run the installed hook exactly as Claude Code will.
+step "Checking the installed hook"
 SAMPLE_KEY="AKIA""IOSFODNN7EXAMPLE"   # AWS's public example key, split so it isn't a literal
-printf '{"hook_event_name":"UserPromptSubmit","prompt":"my key is %s"}' "$SAMPLE_KEY" \
-  | SECRET_GUARD_LOG="$TMP_DIR/final.log" bash "$HOOK_PATH" >/dev/null 2>&1
-blocked=$?
-printf '{"hook_event_name":"UserPromptSubmit","prompt":"hello"}' \
-  | SECRET_GUARD_LOG="$TMP_DIR/final.log" bash "$HOOK_PATH" >/dev/null 2>&1
-allowed=$?
+blocked="$(run_hook "my key is $SAMPLE_KEY")"
+allowed="$(run_hook "hello")"
 if [ "$blocked" = 2 ] && [ "$allowed" = 0 ]; then
-  ok "Installed hook checked: blocks a key, lets normal messages through"
+  ok "Blocks a key, lets normal messages through"
 else
   warn "The installed hook didn't behave as expected (key: exit $blocked, normal: exit $allowed)."
-  warn "Run: bash install-secret-guard.sh --uninstall   and send this output to whoever gave you the script."
+  warn "Remove it with --uninstall and send this output to whoever gave you the script."
+fi
+if [ "$SCOPE" = managed ]; then
+  # Re-run the full test suite against the exact file users will run.
+  SECRET_GUARD_BIN="$TMP_DIR/no-helper-tools" bash "$TMP_DIR/test-secret-guard.sh" "$HOOK_PATH" > "$TMP_DIR/final-tests.out" 2>&1
+  if "$G" -q '^Result: [0-9]* passed, 0 failed' "$TMP_DIR/final-tests.out"; then
+    ok "Full test suite passes against $HOOK_PATH"
+  else
+    warn "Test suite against the installed file: $("$G" '^Result' "$TMP_DIR/final-tests.out")"
+  fi
+  if [ -z "$TEST_ROOT" ] && find "$GUARD_DIR" "$SETTINGS" -perm -o+w 2>/dev/null | "$G" -q .; then
+    warn "Some installed files are writable by everyone; check their permissions."
+  fi
 fi
 
 report success "installed"
@@ -746,9 +964,26 @@ if [ -n "$FIXES" ]; then
   printf '%s\n' "$FIXES" | tr ';' '\n' | while IFS= read -r l; do say "  • ${l# }"; done
   say ""
 fi
-say "Done. Next steps:"
-say "  1. Restart Claude Code, then run /hooks to see the two secret-guard hooks."
-say "  2. Try it: type  my key is ${SAMPLE_KEY}  (AWS's public example key)."
-say "     It should be blocked before it reaches Claude."
-say "  3. Blocks are logged (rule name only, never the key) to ~/.claude/secret-guard.log"
-say "To remove it: bash install-secret-guard.sh --uninstall"
+if [ "$SCOPE" = managed ]; then
+  if [ "$REQUIRE_VERSION" != 1 ] && { [ -z "$CLAUDE_VERSION" ] || version_lt "${CLAUDE_VERSION%% *}" "$ONFAILURE_MIN_VERSION"; }; then
+    say "Note: Claude Code ${CLAUDE_VERSION%% *} is older than $ONFAILURE_MIN_VERSION. The hook still blocks if its script"
+    say "is missing or crashes, but a hook that times out lets the message through. Update"
+    say "Claude Code, or re-run with --require-version to make older versions refuse to start."
+    say ""
+  fi
+  say "Done. Next steps:"
+  say "  1. Each user restarts Claude Code. In Claude Code, /status shows this policy under"
+  say "     Setting sources as (file)."
+  say "  2. Try it: type  my key is ${SAMPLE_KEY}  (AWS's public example key). It should be blocked."
+  say "  3. Users can't remove or override it without admin rights."
+  say "  4. If your org also sets managed settings in the Claude admin console, those replace"
+  say "     this file unless the console policy has \"managedSourcesBehavior\": \"merge\"."
+  say "To remove it: sudo bash install-secret-guard.sh --managed --uninstall"
+else
+  say "Done. Next steps:"
+  say "  1. Restart Claude Code, then run /hooks to see the two secret-guard hooks."
+  say "  2. Try it: type  my key is ${SAMPLE_KEY}  (AWS's public example key)."
+  say "     It should be blocked before it reaches Claude."
+  say "  3. Blocks are logged (rule name only, never the key) to ~/.claude/secret-guard.log"
+  say "To remove it: bash install-secret-guard.sh --uninstall"
+fi

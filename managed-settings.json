@@ -1,5 +1,4 @@
 {
-  "allowManagedHooksOnly": true,
   "permissions": {
     "deny": [
       "Read(**/.env)",
@@ -7,7 +6,8 @@
       "Read(**/*.key)",
       "Read(**/secrets/**)",
       "Read(~/.aws/credentials)"
-    ]
+    ],
+    "disableBypassPermissionsMode": "disable"
   },
   "hooks": {
     "UserPromptSubmit": [
@@ -15,7 +15,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /opt/nulogic/secret-guard.sh"
+            "command": "[ -r \"/opt/nulogic/secret-guard.sh\" ] || { echo 'NULogic secret-guard is missing. Contact IT.' >&2; exit 2; }; bash \"/opt/nulogic/secret-guard.sh\" || exit 2",
+            "timeout": 15,
+            "onFailure": "block"
           }
         ]
       }
@@ -26,10 +28,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /opt/nulogic/secret-guard.sh"
+            "command": "[ -r \"/opt/nulogic/secret-guard.sh\" ] || { echo 'NULogic secret-guard is missing. Contact IT.' >&2; exit 2; }; bash \"/opt/nulogic/secret-guard.sh\" || exit 2",
+            "timeout": 15,
+            "onFailure": "block"
           }
         ]
       }
     ]
-  }
+  },
+  "allowManagedHooksOnly": true
 }

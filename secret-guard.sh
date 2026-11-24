@@ -10,13 +10,23 @@
 # ─────────────────────────────────────────────────────────────
 
 # Behave the same on every machine, whatever the user's shell settings:
-# byte-wise matching (no locale surprises or "illegal byte sequence"),
-# no grep options from the environment, and the installer's helper tools
-# (only present if the default grep/sed failed the self-test) first on PATH.
+# byte-wise matching (no locale surprises or "illegal byte sequence") and
+# no grep options from the environment.
 export LC_ALL=C
 unset GREP_OPTIONS GREP_COLOR GREP_COLORS POSIXLY_CORRECT CDPATH
-SECRET_GUARD_BIN="${SECRET_GUARD_BIN:-$HOME/.claude/hooks/bin}"
-[ -d "$SECRET_GUARD_BIN" ] && PATH="$SECRET_GUARD_BIN:$PATH"
+
+# Helper tools (only present if the default grep/sed failed the installer's
+# self-test) live in bin/ next to this script.
+SECRET_GUARD_MANAGED=0   # the installer sets this to 1 for admin (--managed) installs
+SG_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ "$SECRET_GUARD_MANAGED" = 1 ]; then
+  # Admin install: ignore the user's PATH and overrides, so a fake grep put
+  # earlier on PATH can't switch the checks off.
+  PATH="$SG_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+else
+  SECRET_GUARD_BIN="${SECRET_GUARD_BIN:-$SG_DIR/bin}"
+  [ -d "$SECRET_GUARD_BIN" ] && PATH="$SECRET_GUARD_BIN:$PATH"
+fi
 
 LOG_FILE="${SECRET_GUARD_LOG:-$HOME/.claude/secret-guard.log}"
 INPUT="$(cat)"

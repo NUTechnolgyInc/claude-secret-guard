@@ -15,11 +15,40 @@ bash install-secret-guard.sh
 
 Then restart Claude Code and run `/hooks` to see the two secret-guard hooks.
 
+This per-user install is for testing and pilots: it lives in `~/.claude`, so the user can remove it. For company-wide enforcement, use the managed install below.
+
+## Enforced install (IT / admin)
+
+```bash
+sudo bash install-secret-guard.sh --managed
+```
+
+This installs for every user on the machine (macOS, Linux, WSL), and users can't remove or override it without admin rights:
+
+| What | Where |
+|---|---|
+| Hook script, owned by root | `/opt/nulogic/secret-guard.sh` |
+| Policy file Claude Code always obeys | macOS: `/Library/Application Support/ClaudeCode/managed-settings.json`<br>Linux / WSL: `/etc/claude-code/managed-settings.json` |
+
+The policy (same as [`managed-settings.json`](managed-settings.json)) registers the hooks and deny rules and enforces:
+
+- **Fails closed:** if the script is missing or crashes, every prompt is blocked with "NULogic secret-guard is missing. Contact IT." On Claude Code 2.1.295+, `onFailure: "block"` also blocks on a timeout.
+- **`allowManagedHooksOnly`:** users can't add their own hooks to work around it.
+- **`disableBypassPermissionsMode`:** `--dangerously-skip-permissions` is rejected.
+- **Ignores the user's PATH:** the admin copy of the guard uses only system tools, so a fake `grep` can't switch it off.
+
+If the machine already has a managed policy, the installer merges into it, and `--managed --uninstall` removes only what it added. Run `/status` in Claude Code to confirm: the policy shows under *Setting sources* as `(file)`.
+
 | Option | What it does |
 |---|---|
-| `--uninstall` | Removes the hooks, the hook script, and only the rules the installer added |
+| `--uninstall` | Removes the hooks, the hook script, and only the rules and settings the installer added |
+| `--managed` | System-wide, admin-enforced install (needs sudo) |
+| `--strict-permissions` | With `--managed`: users' own allow/deny rules are ignored; only the policy's rules apply |
+| `--require-version` | With `--managed`: Claude Code older than 2.1.295 refuses to start, so a hook timeout also blocks |
 | `--no-report` | Skips the one-time install report |
 | `--yes` | Approves tool installs (package manager, sudo) without asking |
+
+**Limits:** anyone with admin rights on their laptop can still change the policy, so keep developers off local admin, or re-run the installer from your device management to repair drift. If your org also sets managed settings in the Claude admin console, those replace this file unless the console policy sets `"managedSourcesBehavior": "merge"`.
 
 Works on macOS, Linux, and Windows via Git Bash or WSL. Only `bash` is required: the installer downloads `jq` (checksum-verified) or installs GNU `grep`/`sed` if they're missing, repairs common `settings.json` mistakes, and re-runs its self-test after each fix. If it can't fix something, it explains why and changes nothing.
 
@@ -55,16 +84,18 @@ bash fetch-reports.sh status=failed
 | `build-installer.sh` | Builds `install-secret-guard.sh` and its `.sha256` |
 | `fetch-reports.sh` | Lists install reports from the API |
 | `api-server/` | Reporting API (Vercel + MongoDB) |
-| `managed-settings.json` | Org-wide config for MDM rollout (`/opt/nulogic/secret-guard.sh`) |
+| `managed-settings.json` | The policy `--managed` writes, for reference or other deployment tools |
 | `settings.local-test.json` | The same hooks for a single user's `~/.claude/settings.json` |
 | `docs/secret-guard-guide.html` | Guide for colleagues |
+| `docs/announcement.md` | Rollout announcement for Slack or email |
+| `docs/leaked-key-runbook.md` | What to do when a key does get pasted somewhere |
 
 ## Releasing a new version
 
 ```bash
 bash test-secret-guard.sh ./secret-guard.sh
-bash build-installer.sh 1.3.1
-gh release create v1.3.1 install-secret-guard.sh install-secret-guard.sh.sha256 --title v1.3.1 --notes "What changed"
+bash build-installer.sh 1.4.1
+gh release create v1.4.1 install-secret-guard.sh install-secret-guard.sh.sha256 --title v1.4.1 --notes "What changed"
 ```
 
 The build reads the report token from `SECRET_GUARD_REPORT_TOKEN` or `~/.config/secret-guard-api/ingest-token`. It's an ingest-only token (it can add install records, nothing else) and is never committed; the built installer, which contains it, is only published as a release asset.
