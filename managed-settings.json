@@ -1,0 +1,35 @@
+{
+  "allowManagedHooksOnly": true,
+  "permissions": {
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/secrets/**)",
+      "Read(~/.aws/credentials)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /opt/nulogic/secret-guard.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Write|Edit|MultiEdit|Grep|AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /opt/nulogic/secret-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
